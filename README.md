@@ -1,8 +1,17 @@
-# Katabump Server Auto-Renewal Tool
+# Katabump Server Auto-Renewal
 
 ## 🚀 GitHub Actions 云端运行 (推荐)
 
-这是最省心的方式，配置一次即可每天自动执行。
+🔐 Secrets 配置
+
+| Secret 名称         | 是否必填 | 说明                                              |
+|---------------------|----------|---------------------------------------------------|
+| USERS_JSON      | ✅ 必填  | Katabump账号密码，json格式                             |
+| PROXY_NODE      | ❌ 可选  | 代理链接（需包含协议，如：socks5://）     |
+| TG_BOT_TOKEN        | ❌ 可选  | Telegram Bot Token（用于发送通知）                |
+| TG_CHAT_ID          | ❌ 可选  | Telegram Chat ID（接收通知的用户或群组 ID）        |
+
+━━━━━━━━━━━━━━━━━━━━━━
 
 1. **Fork 本仓库** 到你的 GitHub 账号。
 2. 进入你的仓库，点击 **Settings** -> **Secrets and variables** -> **Actions**。
