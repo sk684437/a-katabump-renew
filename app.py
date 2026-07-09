@@ -74,6 +74,9 @@ def load_accounts() -> list:
 
 def _validate_accounts(accounts: list) -> list:
     """校验并过滤账户列表"""
+    # 全局 NODE_LINK 环境变量（对所有账户生效的兜底）
+    global_node_link = os.environ.get("NODE_LINK", "").strip()
+
     valid = []
     for i, acct in enumerate(accounts):
         if not isinstance(acct, dict):
@@ -84,7 +87,11 @@ def _validate_accounts(accounts: list) -> list:
         if not email or not pwd:
             print(f"⚠️ 第 {i+1} 个账户缺少 email 或 password，已跳过")
             continue
-        valid.append({"email": email, "password": pwd})
+
+        # node_link：优先取账户内配置，其次全局环境变量
+        node_link = (acct.get("node_link") or "").strip() or global_node_link
+
+        valid.append({"email": email, "password": pwd, "node_link": node_link})
 
     print(f"📋 共加载 {len(valid)} 个有效账户")
     return valid
@@ -367,38 +374,21 @@ def handle_turnstile(sb) -> bool:
 
 # ===== 登录 =====
 
-def login(sb, email: str, password: str) -> bool:
-    print(f"\n🌐 打开登录页面: {BASE_URL}/auth/login")
-    sb.uc_open_with_reconnect(BASE_URL + "/auth/login", reconnect_time=5)
-    time.sleep(6)
-
-    # 先等待 Cloudflare 验证通过（最多等 30 秒）
-    print("⏳ 等待 Cloudflare 验证通过...")
-    cf_passed = False
-    for i in range(30):
-        page_src = sb.get_page_source() or ""
-        if 'input[name="email"]' in page_src.lower() or 'name="email"' in page_src.lower():
-            cf_passed = True
-            print(f"✅ Cloudflare 验证已通过（{i+1}s）")
-            break
-        time.sleep(1)
-    if not cf_passed:
-        print("⚠️ Cloudflare 验证可能未通过，继续尝试...")
-
+def _wait_login_form(sb, timeout=15) -> bool:
+    """等待登录表单的 email 输入框出现"""
     try:
-        sb.wait_for_element('input[name="email"]', timeout=15)
+        sb.wait_for_element('input[name="email"]', timeout=timeout)
+        return True
     except Exception:
         try:
             sb.wait_for_element('input[name="Email"]', timeout=5)
+            return True
         except Exception:
-            print("❌ 页面未加载出登录表单")
-            cur_url = sb.get_current_url()
-            page_title = sb.get_title() or ""
-            print(f"  当前 URL: {cur_url}")
-            print(f"  当前标题: {page_title}")
-            sb.save_screenshot("login_load_fail.png")
             return False
 
+
+def _fill_and_submit(sb, email: str, password: str) -> None:
+    """填写邮箱密码并提交（不判断是否成功）"""
     print("🍪 关闭可能的 Cookie 弹窗...")
     try:
         for btn in sb.find_elements("button"):
@@ -417,32 +407,82 @@ def login(sb, email: str, password: str) -> bool:
     js_fill_input(sb, 'input[name="password"]', password)
     time.sleep(1)
 
+    # 检测 Turnstile 并处理
     if sb.execute_script(_EXISTS_JS):
         if not handle_turnstile(sb):
             print("❌ 登录界面的 Turnstile 验证失败")
             sb.save_screenshot("login_turnstile_fail.png")
-            return False
+            return
     else:
-        print("ℹ️ 未检测到 Turnstile")
+        print("ℹ️ 未检测到 Turnstile（可能后端静默验证）")
 
     print("🖱️ 敲击回车提交表单...")
     sb.press_keys('input[name="password"]', '\n')
 
-    print("⏳ 等待登录跳转...")
-    for _ in range(12):
-        time.sleep(1)
+
+def login(sb, email: str, password: str, max_retry: int = 3) -> bool:
+    """登录账户，提交后若遇 Cloudflare captcha 错误自动重试"""
+    for attempt in range(1, max_retry + 1):
+        print(f"\n🌐 [尝试 {attempt}/{max_retry}] 打开登录页面: {BASE_URL}/auth/login")
+        sb.uc_open_with_reconnect(BASE_URL + "/auth/login", reconnect_time=5)
+        time.sleep(6)
+
+        # 先等待 Cloudflare 验证通过（最多等 30 秒）
+        print("⏳ 等待 Cloudflare 验证通过...")
+        cf_passed = False
+        for i in range(30):
+            page_src = sb.get_page_source() or ""
+            if 'input[name="email"]' in page_src.lower() or 'name="email"' in page_src.lower():
+                cf_passed = True
+                print(f"✅ Cloudflare 验证已通过（{i+1}s）")
+                break
+            time.sleep(1)
+        if not cf_passed:
+            print("⚠️ Cloudflare 验证可能未通过，继续尝试...")
+
+        if not _wait_login_form(sb, timeout=15):
+            print("❌ 页面未加载出登录表单")
+            cur_url = sb.get_current_url()
+            page_title = sb.get_title() or ""
+            print(f"  当前 URL: {cur_url}")
+            print(f"  当前标题: {page_title}")
+            sb.save_screenshot("login_load_fail.png")
+            continue  # 重试
+
+        _fill_and_submit(sb, email, password)
+
+        print("⏳ 等待登录跳转...")
+        for _ in range(12):
+            time.sleep(1)
+            cur_url = sb.get_current_url().split('?')[0].lower()
+            page_title = sb.get_title() or ""
+            if cur_url.startswith(f"{BASE_URL}/dashboard") or "Dashboard | KataBump" in page_title.lower():
+                break
+
         cur_url = sb.get_current_url().split('?')[0].lower()
         page_title = sb.get_title() or ""
         if cur_url.startswith(f"{BASE_URL}/dashboard") or "Dashboard | KataBump" in page_title.lower():
-            break
+            print(f"✅ 登录成功！(URL: {sb.get_current_url()}, Title: {page_title})")
+            return True
 
-    cur_url = sb.get_current_url().split('?')[0].lower()
-    page_title = sb.get_title() or ""
-    if cur_url.startswith(f"{BASE_URL}/dashboard") or "Dashboard | KataBump" in page_title.lower():
-        print(f"✅ 登录成功！(URL: {sb.get_current_url()}, Title: {page_title})")
-        return True
+        # 登录失败：判断是否 captcha 错误
+        full_url = sb.get_current_url().lower()
+        if "error=captcha" in full_url or "captcha" in full_url:
+            print(f"⚠️ 第 {attempt} 次登录被 Cloudflare captcha 拦截，清理状态后重试...")
+            # 清 Cookie 让下一个重试拿到新验证会话
+            try:
+                sb.execute_cdp_cmd("Network.clearBrowserCookies", {})
+            except Exception:
+                try: sb.driver.delete_all_cookies()
+                except Exception: pass
+            time.sleep(2)
+            continue
+        else:
+            print(f"❌ 登录失败（非 captcha 原因），页面未跳转到账户页。(URL: {sb.get_current_url()}, Title: {page_title})")
+            sb.save_screenshot("login_failed.png")
+            return False  # 账号/密码错误，重试无意义
 
-    print(f"❌ 登录失败，页面未跳转到账户页。(URL: {sb.get_current_url()}, Title: {page_title})")
+    print("❌ 多次重试后仍登录失败")
     sb.save_screenshot("login_failed.png")
     return False
 
@@ -471,17 +511,24 @@ def logout(sb):
         except Exception:
             pass
 
-    # 跳转到登录页
-    sb.execute_script(f"window.location.href = '{BASE_URL}/auth/login';")
-    time.sleep(3)
+    # 用 uc_open_with_reconnect 重新走一遍 Cloudflare，
+    # 让下一个账户拿到干净的验证会话（避免被判定为同设备多账户登录）
+    try:
+        sb.uc_open_with_reconnect(BASE_URL + "/auth/login", reconnect_time=5)
+    except Exception:
+        sb.open(BASE_URL + "/auth/login")
+    time.sleep(4)
 
-    # 确认已回到登录页（如果没有 email 输入框，强制刷新）
+    # 确认已回到登录页
     try:
         sb.wait_for_element('input[name="email"]', timeout=10)
         print("✅ 已返回到登录页")
     except Exception:
         print("⚠️ 未检测到登录表单，强制刷新...")
-        sb.open(BASE_URL + "/auth/login")
+        try:
+            sb.open(BASE_URL + "/auth/login")
+        except Exception:
+            pass
         time.sleep(3)
 
 
@@ -496,19 +543,32 @@ def _read_alert(sb):
         return ""
 
 
-def _goto_server_detail(sb, email: str) -> bool:
-    """在 Dashboard 首页查找并点击 See 进入服务器详情页"""
+def _goto_server_detail(sb, email: str, node_link: str = "") -> bool:
+    """进入服务器详情页。
+
+    如果 node_link 有值，直接导航到该链接；
+    否则在 Dashboard 首页查找并点击 See 链接。
+    """
     print("\n🖥️  正在进入服务器续期页...")
     time.sleep(5)
 
-    # 检查页面顶部是否已有"还无法续期"全局提示
-    alert_text = _read_alert(sb)
-    if alert_text and "can't renew" in alert_text.lower():
-        print(f"ℹ️  页面顶部提示: {alert_text}")
-        send_tg_message("ℹ️", "⚠️ 未到续期时间", alert_text, email)
-        return False
+    # ===== 如果配置了 node_link，直接跳转 =====
+    if node_link:
+        print(f"🔗 使用 node_link: {node_link}")
+        sb.open(node_link)
+        time.sleep(5)
 
-    # 多种选择器尝试查找 See 链接
+        # 跳转后检查是否提示"无法续期"
+        alert_text = _read_alert(sb)
+        if alert_text and "can't renew" in alert_text.lower():
+            print(f"ℹ️  页面顶部提示: {alert_text}")
+            send_tg_message("ℹ️", "⚠️ 未到续期时间", alert_text, email)
+            return False
+
+        print(f"📄 当前页面: {sb.get_current_url()}")
+        return True
+
+    # ===== 没有 node_link，走自动查找 =====
     selectors = [
         'a[href*="/servers/edit?id="]',
         'td a[href*="/servers/edit"]',
@@ -725,13 +785,13 @@ def _check_renew_result(sb, email: str):
         send_tg_message("ℹ️", "续期操作已执行", "未检测到明确提示", email)
 
 
-def renew_server(sb, email: str):
+def renew_server(sb, email: str, node_link: str = ""):
     """登录成功后调用：自动进入详情页 -> Renew -> ALTCHA -> 提交"""
     print("\n" + "#" * 25)
     print(f"  开始自动续期: {mask_email(email)}")
     print("#" * 25)
 
-    if not _goto_server_detail(sb, email):
+    if not _goto_server_detail(sb, email, node_link):
         return
 
     if not _open_renew_modal(sb):
@@ -761,54 +821,62 @@ def main():
     # 代理配置（全局生效）
     IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
     proxy_str = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1081"
-    sb_kwargs = {"uc": True, "headless": False}
-
-    if IS_PROXY:
-        print(f"🔗 挂载代理: {proxy_str}")
-        sb_kwargs["proxy"] = proxy_str
-    else:
-        print("🌐 未使用代理，直连访问")
 
     # 统计
     total = len(accounts)
     success_count = 0
     fail_count = 0
 
-    with SB(**sb_kwargs) as sb:
-        # 显示出口 IP
+    for idx, acct in enumerate(accounts, start=1):
+        email    = acct["email"]
+        password = acct["password"]
+        node_link = acct.get("node_link", "")
+
+        if node_link:
+            print(f"   🔗 已配置 node_link")
+
+        print("\n" + "=" * 40)
+        print(f"📌 正在处理第 {idx}/{total} 个账户: {mask_email(email)}")
+        print("=" * 40)
+
+        # 每个账户独立浏览器上下文：
+        # 账户1 用普通窗口，账户2起用隐身窗口(incognito)彻底隔离 Cloudflare 状态
+        sb_kwargs = {"uc": True, "headless": False}
+        if idx > 1:
+            sb_kwargs["incognito"] = True
+            print("🕶️ 使用隐身窗口（隔离 Cloudflare 会话）")
+        if IS_PROXY:
+            print(f"🔗 挂载代理: {proxy_str}")
+            sb_kwargs["proxy"] = proxy_str
+        else:
+            print("🌐 未使用代理，直连访问")
+
         try:
-            sb.open("https://api.ip.sb/ip")
-            print(f"🌐 当前出口IP: {sb.get_text('body')}")
-        except Exception:
-            pass
+            with SB(**sb_kwargs) as sb:
+                # 显示出口 IP
+                try:
+                    sb.open("https://api.ip.sb/ip")
+                    print(f"🌐 当前出口IP: {sb.get_text('body')}")
+                except Exception:
+                    pass
 
-        for idx, acct in enumerate(accounts, start=1):
-            email    = acct["email"]
-            password = acct["password"]
+                # 登录
+                if not login(sb, email, password):
+                    print(f"\n❌ 账户 [{mask_email(email)}] 登录失败，跳过续期。")
+                    send_tg_message("❌", "登录失败", "未知", email)
+                    fail_count += 1
+                    continue  # 下一账户会开新浏览器，无需登出
 
-            print("\n" + "=" * 40)
-            print(f"📌 正在处理第 {idx}/{total} 个账户: {mask_email(email)}")
-            print("=" * 40)
+                # 续期
+                renew_server(sb, email, node_link)
 
-            # 登录
-            if not login(sb, email, password):
-                print(f"\n❌ 账户 [{mask_email(email)}] 登录失败，跳过续期。")
-                send_tg_message("❌", "登录失败", "未知", email)
-                fail_count += 1
-                # 登录失败 → 清理状态后继续下一个
-                logout(sb)
-                continue
+                success_count += 1
 
-            # 续期
-            renew_server(sb, email)
-
-            # 如果是最后一个账户，不需要登出
-            if idx < total:
-                logout(sb)
-            else:
-                print("\n✅ 所有账户处理完毕。")
-
-            success_count += 1
+        except Exception as e:
+            print(f"\n❌ 账户 [{mask_email(email)}] 处理异常: {e}")
+            send_tg_message("❌", "运行异常", str(e)[:200], email)
+            fail_count += 1
+            continue
 
     # 最终统计
     print("\n" + "=" * 40)
