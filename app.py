@@ -546,22 +546,61 @@ def logout(sb):
 
 # ===== Tab 辅助函数（多 Tab 复用同一浏览器） =====
 
+def _get_current_handle(sb) -> str:
+    """稳妥获取当前窗口 handle。
+
+    优先用 SeleniumBase 内置方法（uc 模式下比裸 driver 调用更稳），
+    失败时退回 list 式 window_handles[0]（会重新同步会话，比裸
+    current_window_handle 更不容易撞上 'Connection refused'）。
+    """
+    try:
+        return sb.get_current_window_handle()
+    except Exception:
+        try:
+            return sb.driver.current_window_handle
+        except Exception:
+            return sb.driver.window_handles[0]
+
+
 def _open_new_tab(sb, url: str) -> str:
     """打开新 Tab 并切换过去，返回打开前正在用的 handle（作为锚点）"""
-    anchor = sb.driver.current_window_handle
-    sb.execute_script(f"window.open('{url}', '_blank');")
-    sb.wait_for_new_window()  # SeleniumBase 内置：等待新窗口出现
-    sb.switch_to_window(sb.driver.window_handles[-1])
+    anchor = _get_current_handle(sb)
+    try:
+        # 优先用 SeleniumBase 内置方法（更稳，会自动切到新 Tab）
+        sb.open_new_window()
+    except Exception:
+        # 兜底：JS 打开新 Tab
+        sb.execute_script(f"window.open('{url}', '_blank');")
+        sb.wait_for_new_window()
+        sb.switch_to_window(sb.driver.window_handles[-1])
+    # 在新 Tab 里打开目标 URL
+    try:
+        sb.open(url)
+    except Exception:
+        try:
+            sb.execute_script(f"window.location.href='{url}';")
+        except Exception:
+            pass
     return anchor
 
 
 def _close_tab_and_return(sb, anchor: str):
     """关闭当前 Tab、回到 anchor、清掉当前账户的会话 Cookie"""
     try:
-        sb.driver.close()
+        sb.close_current_window()
     except Exception:
-        pass
-    sb.switch_to_window(anchor)
+        try:
+            sb.driver.close()
+        except Exception:
+            pass
+    # 切回锚点（锚点失效则回退到第一个 Tab）
+    try:
+        sb.switch_to_window(anchor)
+    except Exception:
+        try:
+            sb.switch_to_window(sb.driver.window_handles[0])
+        except Exception:
+            pass
     try:
         sb.execute_cdp_cmd("Network.clearBrowserCookies", {})
     except Exception:
@@ -876,15 +915,22 @@ def main():
         print("🌐 未使用代理，直连访问")
 
     with SB(**sb_kwargs) as sb:
-        # 显示出口 IP（只在开场打印一次）
+        # ===== 先稳稳拿到初始 Tab 锚点（在任何外部导航之前！）=====
+        # 否则像 GitHub Actions 上那样：先 sb.open 外部页 → driver 会话
+        # 进入不稳定/重连态 → 紧接着裸 current_window_handle 直接撞上
+        # 'Connection refused'。这里用 _get_current_handle 兜底。
+        try:
+            anchor = _get_current_handle(sb)
+        except Exception as e:
+            print(f"⚠️ 初始化窗口句柄失败（浏览器会话可能已断开）: {e}")
+            return
+
+        # 显示出口 IP（非必需，独立 try/except，失败不致命）
         try:
             sb.open("https://api.ip.sb/ip")
             print(f"🌐 当前出口IP: {sb.get_text('body')}")
-        except Exception:
-            pass
-
-        # 锚点：记录开第一笔账户前所在的 Tab handle
-        anchor = sb.driver.current_window_handle
+        except Exception as e:
+            print(f"⚠️ 出口IP检查失败（忽略）: {e}")
 
         for idx, acct in enumerate(accounts, start=1):
             email     = acct["email"]
