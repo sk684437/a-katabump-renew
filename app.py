@@ -1,116 +1,46 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Katabump 多账户自动续期脚本（多 Tab 版本）
-支持从环境变量 ACCOUNTS_JSON 或 accounts.json 读取多个账户
-复用同一个浏览器窗口，每个账户开一个 Tab，顺序登录 + 续期
-"""
 
-import json
 import os
 import time
+import json
 import subprocess
 import requests
 from seleniumbase import SB
 
-# ===== 配置 =====
+# ================= 配置与环境变量 =================
 
-# TG 通知（全局配置）
-TG_CHAT_ID   = os.environ.get("TG_CHAT_ID") or ""
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""
+# 多账号配置 (推荐使用 JSON 格式):
+# 例: '[{"email": "a@abc.com", "password": "p1"}, {"email": "b@abc.com", "password": "p2"}]'
+ACCOUNTS_JSON = os.environ.get("KATABUMP_ACCOUNTS") or ""
+
+# 单账号兼容 (如果在环境变量里只配置了这俩，依然支持)
+SINGLE_EMAIL    = os.environ.get("KATABUMP_EMAIL") or ""
+SINGLE_PASSWORD = os.environ.get("KATABUMP_PASSWORD") or ""
+
+TG_CHAT_ID   = os.environ.get("TG_CHAT_ID") or ""        # tg通知 chat id(可选)
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""      # tg通知bot token(可选)
 
 BASE_URL = "https://dashboard.katabump.com"  # 网站链接
 
-# ===== 工具函数 =====
 
-def load_accounts() -> list:
-    """从环境变量 ACCOUNTS_JSON 或 accounts.json 加载账户列表"""
-
-    # 优先从环境变量读取
-    env_json = os.environ.get("ACCOUNTS_JSON", "").strip()
-    if env_json:
-        print("📦 从环境变量 ACCOUNTS_JSON 读取账户...")
+def get_accounts():
+    """解析并返回包含多个账户信息的列表"""
+    accounts = []
+    if ACCOUNTS_JSON:
         try:
-            accounts = json.loads(env_json)
-        except json.JSONDecodeError as e:
-            print(f"❌ ACCOUNTS_JSON 格式错误: {e}")
-            return []
-
-        if not isinstance(accounts, list):
-            print("❌ ACCOUNTS_JSON 应为 JSON 数组 []")
-            return []
-
-        if len(accounts) == 0:
-            print("⚠️ ACCOUNTS_JSON 为空数组")
-            return []
-
-        return _validate_accounts(accounts)
-
-    # 备用：从 accounts.json 文件读取
-    acct_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts.json")
-    if os.path.isfile(acct_file):
-        print(f"📁 从文件读取账户: {acct_file}")
-        try:
-            with open(acct_file, "r", encoding="utf-8") as f:
-                accounts = json.load(f)
-        except json.JSONDecodeError as e:
-            print(f"❌ {acct_file} 格式错误: {e}")
-            return []
-
-        if not isinstance(accounts, list):
-            print(f"❌ {acct_file} 应为 JSON 数组 []")
-            return []
-
-        if len(accounts) == 0:
-            print(f"⚠️ {acct_file} 为空")
-            return []
-
-        return _validate_accounts(accounts)
-
-    print("❌ 未找到账户配置。请设置环境变量 ACCOUNTS_JSON 或创建 accounts.json")
-    print("   格式: [{\"email\": \"...\", \"password\": \"...\"}]")
-    return []
+            accounts = json.loads(ACCOUNTS_JSON)
+        except Exception as e:
+            print(f"⚠️ 解析 KATABUMP_ACCOUNTS JSON 失败: {e}")
+            print("请确保环境变量 KATABUMP_ACCOUNTS 的值是合法的 JSON 数组格式。")
+    elif SINGLE_EMAIL and SINGLE_PASSWORD:
+        # 向下兼容单账号
+        accounts.append({"email": SINGLE_EMAIL, "password": SINGLE_PASSWORD})
+    return accounts
 
 
-def _validate_accounts(accounts: list) -> list:
-    """校验并过滤账户列表"""
-    # 全局 NODE_LINK 环境变量（对所有账户生效的兜底）
-    global_node_link = os.environ.get("NODE_LINK", "").strip()
-
-    valid = []
-    for i, acct in enumerate(accounts):
-        if not isinstance(acct, dict):
-            print(f"⚠️ 第 {i+1} 个账户不是对象，已跳过")
-            continue
-        email = (acct.get("email") or "").strip()
-        pwd   = (acct.get("password") or "").strip()
-        if not email or not pwd:
-            print(f"⚠️ 第 {i+1} 个账户缺少 email 或 password，已跳过")
-            continue
-
-        # node_link：优先取账户内配置，其次全局环境变量
-        node_link = (acct.get("node_link") or "").strip() or global_node_link
-
-        valid.append({"email": email, "password": pwd, "node_link": node_link})
-
-    print(f"📋 共加载 {len(valid)} 个有效账户")
-    return valid
-
-
-def mask_email(email: str) -> str:
-    """邮箱脱敏：保留用户名前2位和后2位，中间用****代替"""
-    if '@' in email:
-        name, domain = email.split('@', 1)
-        if len(name) > 4:
-            return f"{name[:2]}****{name[-2:]}@{domain}"
-        else:
-            return f"{name}@{domain}"
-    else:
-        return email[:2] + '****'
-
-
-def send_tg_message(status_icon, status_text, time_left="", email=""):
-    """Telegram 推送通知（email 用于脱敏显示）"""
+# ================= Telegram 推送模块 =================
+def send_tg_message(status_icon, status_text, email, time_left=""):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         print("ℹ️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过 Telegram 推送。")
         return
@@ -119,7 +49,15 @@ def send_tg_message(status_icon, status_text, time_left="", email=""):
     local_time = time.gmtime(time.time() + 8 * 3600)
     current_time_str = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
 
-    masked_email = mask_email(email) if email else "未知"
+    # 邮箱脱敏：保留用户名前2位和后2位，中间用****代替
+    if '@' in email:
+        name, domain = email.split('@', 1)
+        if len(name) > 4:
+            masked_email = f"{name[:2]}****{name[-2:]}@{domain}"
+        else:
+            masked_email = f"{name}@{domain}"
+    else:
+        masked_email = email[:2] + '****' if len(email) > 2 else email
 
     text = (
         f"🇫🇷 katabump 续期通知\n\n"
@@ -133,7 +71,7 @@ def send_tg_message(status_icon, status_text, time_left="", email=""):
         "chat_id": TG_CHAT_ID,
         "text": text
     }
-
+    
     try:
         r = requests.post(url, json=payload, timeout=10)
         if r.status_code == 200:
@@ -143,9 +81,7 @@ def send_tg_message(status_icon, status_text, time_left="", email=""):
     except Exception as e:
         print(f"⚠️ Telegram 通知发送异常: {e}")
 
-
-# ===== 页面注入脚本 =====
-
+# ================= 页面注入脚本 =================
 _EXPAND_JS = """
 (function() {
     var ts = document.querySelector('input[name="cf-turnstile-response"]');
@@ -183,32 +119,6 @@ _SOLVED_JS = """
 })()
 """
 
-_COORDS_JS = """
-(function(){
-    var iframes = document.querySelectorAll('iframe');
-    for (var i = 0; i < iframes.length; i++) {
-        var src = iframes[i].src || '';
-        if (src.includes('cloudflare') || src.includes('turnstile') || src.includes('challenges')) {
-            var r = iframes[i].getBoundingClientRect();
-            if (r.width > 0 && r.height > 0)
-                return {cx: Math.round(r.x + 30), cy: Math.round(r.y + r.height / 2)};
-        }
-    }
-    var inp = document.querySelector('input[name="cf-turnstile-response"]');
-    if (inp) {
-        var p = inp.parentElement;
-        for (var j = 0; j < 5; j++) {
-            if (!p) break;
-            var r = p.getBoundingClientRect();
-            if (r.width > 100 && r.height > 30)
-                return {cx: Math.round(r.x + 30), cy: Math.round(r.y + r.height / 2)};
-            p = p.parentElement;
-        }
-    }
-    return null;
-})()
-"""
-
 _WININFO_JS = """
 (function(){
     return {
@@ -220,7 +130,7 @@ _WININFO_JS = """
 })()
 """
 
-# ===== ALTCHA 相关脚本 =====
+# ================= 自动续期相关 =================
 
 _ALTCHA_EXPAND_JS = """
 (function() {
@@ -252,24 +162,26 @@ _ALTCHA_EXPAND_JS = """
 _ALTCHA_SOLVED_JS = """
 (function(){
     var modal = document.querySelector('div.modal.show') || document;
+    // hidden input 有值
     var inputs = modal.querySelectorAll('input[type="hidden"]');
     for (var i = 0; i < inputs.length; i++) {
         var n = (inputs[i].name || '').toLowerCase();
         if ((n.includes('altcha') || n.includes('captcha')) &&
             inputs[i].value && inputs[i].value.length > 20) return true;
     }
+    // checkbox 变为 disabled
     var cbs = modal.querySelectorAll('input[type="checkbox"]');
     for (var j = 0; j < cbs.length; j++) {
         if (cbs[j].disabled) return true;
     }
+    // widget data-state 属性
     var w = modal.querySelector('[data-state="verified"],.altcha--verified,.altcha-verified');
     if (w) return true;
     return false;
 })()
 """
 
-# ===== 底层输入工具 =====
-
+# 底层输入工具
 def js_fill_input(sb, selector: str, text: str):
     safe_text = text.replace('\\', '\\\\').replace('"', '\\"')
     sb.execute_script(f"""
@@ -287,7 +199,6 @@ def js_fill_input(sb, selector: str, text: str):
     }})()
     """)
 
-
 def _activate_window():
     for cls in ["chrome", "chromium", "Chromium", "Chrome", "google-chrome"]:
         try:
@@ -304,7 +215,6 @@ def _activate_window():
     except Exception:
         pass
 
-
 def _xdotool_click(x: int, y: int):
     _activate_window()
     try:
@@ -314,30 +224,7 @@ def _xdotool_click(x: int, y: int):
     except Exception:
         os.system(f"xdotool mousemove {x} {y} click 1 2>/dev/null")
 
-
-# ===== 人机验证处理 =====
-
-def _click_turnstile(sb):
-    try:
-        coords = sb.execute_script(_COORDS_JS)
-    except Exception as e:
-        print(f"⚠️ 获取 Turnstile 坐标失败: {e}")
-        return
-    if not coords:
-        print("⚠️ 无法定位 Turnstile 坐标")
-        return
-    try:
-        wi = sb.execute_script(_WININFO_JS)
-    except Exception:
-        wi = {"sx": 0, "sy": 0, "oh": 800, "ih": 768}
-
-    bar = wi["oh"] - wi["ih"]
-    ax  = coords["cx"] + wi["sx"]
-    ay  = coords["cy"] + wi["sy"] + bar
-    print(f"🖱️ 点击验证框 Turnstile ({ax}, {ay})")
-    _xdotool_click(ax, ay)
-
-
+# 人机验证处理
 def handle_turnstile(sb) -> bool:
     print("🔍 处理 Cloudflare Turnstile 验证...")
     time.sleep(2)
@@ -353,42 +240,58 @@ def handle_turnstile(sb) -> bool:
 
     for attempt in range(6):
         if sb.execute_script(_SOLVED_JS):
-            print(f"✅ Turnstile 通过（第 {attempt + 1} 次尝试）")
+            print(f"✅ Turnstile 通过（第 {attempt} 次尝试）")
             return True
-        try: sb.execute_script(_EXPAND_JS)
-        except Exception: pass
-        time.sleep(0.3)
 
-        _click_turnstile(sb)
+        print(f"🖱️ 第 {attempt + 1} 次调用 uc_gui_click_captcha...")
+        try:
+            sb.uc_gui_click_captcha()
+        except Exception as e:
+            print(f"⚠️ uc_gui_click_captcha 调用异常: {e}")
 
-        for _ in range(8):
+        for _ in range(16):
             time.sleep(0.5)
             if sb.execute_script(_SOLVED_JS):
                 print(f"✅ Turnstile 通过（第 {attempt + 1} 次尝试）")
                 return True
+
         print(f"⚠️ 第 {attempt + 1} 次未通过，重试...")
 
     print("  ❌ Turnstile 6 次均失败")
     return False
 
+# 账户登录
+def login(sb, email, password) -> bool:
+    print(f"🌐 打开登录页面: {BASE_URL}/auth/login")
+    sb.uc_open_with_reconnect(BASE_URL + "/auth/login", reconnect_time=8)
+    time.sleep(6)
 
-# ===== 登录 =====
+    print("⏳ 等待 Cloudflare 验证通过...")
+    cf_passed = False
+    for i in range(30):
+        page_src = sb.get_page_source() or ""
+        if 'input[name="email"]' in page_src.lower() or 'name="email"' in page_src.lower():
+            cf_passed = True
+            print(f"✅ Cloudflare 验证已通过（{i+1}s）")
+            break
+        time.sleep(1)
+    if not cf_passed:
+        print("⚠️ Cloudflare 验证可能未通过，继续尝试...")
 
-def _wait_login_form(sb, timeout=15) -> bool:
-    """等待登录表单的 email 输入框出现"""
     try:
-        sb.wait_for_element('input[name="email"]', timeout=timeout)
-        return True
+        sb.wait_for_element('input[name="email"]', timeout=15)
     except Exception:
         try:
             sb.wait_for_element('input[name="Email"]', timeout=5)
-            return True
         except Exception:
+            print("❌ 页面未加载出登录表单")
+            cur_url = sb.get_current_url()
+            page_title = sb.get_title() or ""
+            print(f"  当前 URL: {cur_url}")
+            print(f"  当前标题: {page_title}")
+            sb.save_screenshot(f"login_load_fail_{email}.png")
             return False
 
-
-def _fill_and_submit(sb, email: str, password: str) -> None:
-    """填写邮箱密码并提交（不判断是否成功）"""
     print("🍪 关闭可能的 Cookie 弹窗...")
     try:
         for btn in sb.find_elements("button"):
@@ -402,218 +305,50 @@ def _fill_and_submit(sb, email: str, password: str) -> None:
     print(f"📧 填写邮箱...")
     js_fill_input(sb, 'input[name="email"]', email)
     time.sleep(0.3)
-
+    
     print("🔑 填写密码...")
     js_fill_input(sb, 'input[name="password"]', password)
     time.sleep(1)
 
-    # 检测 Turnstile 并处理
-    if sb.execute_script(_EXISTS_JS):
+    print("⏳ 等待 Turnstile 验证框出现...")
+    ts_found = False
+    for i in range(10):
+        if sb.execute_script(_EXISTS_JS):
+            ts_found = True
+            print(f"✅ 检测到 Turnstile（{i+1}s）")
+            break
+        time.sleep(1)
+
+    if ts_found:
         if not handle_turnstile(sb):
             print("❌ 登录界面的 Turnstile 验证失败")
-            sb.save_screenshot("login_turnstile_fail.png")
-            return
+            sb.save_screenshot(f"login_turnstile_fail_{email}.png")
+            return False
     else:
-        print("ℹ️ 未检测到 Turnstile（可能后端静默验证）")
+        print("ℹ️ 未检测到 Turnstile")
 
     print("🖱️ 敲击回车提交表单...")
     sb.press_keys('input[name="password"]', '\n')
 
-
-def login(sb, email: str, password: str, max_retry: int = 3) -> bool:
-    """登录账户，提交后若遇 Cloudflare captcha 错误自动重试。
-
-    注意：本函数内部只用 uc_open_with_reconnect 导航【一次】到登录页，
-    不要在函数开头清 Cookie——那会抹掉刚刚建立的 cf_clearance，
-    导致紧接着的二次导航被 Cloudflare 判定为机器人。账户之间的
-    Cookie 隔离交给 _open_new_tab（切换账户时清空）处理。
-    """
-    for attempt in range(1, max_retry + 1):
-        print(f"\n🌐 [尝试 {attempt}/{max_retry}] 打开登录页面: {BASE_URL}/auth/login")
-        sb.uc_open_with_reconnect(BASE_URL + "/auth/login", reconnect_time=5)
-        time.sleep(6)
-
-        # 先等待 Cloudflare 验证通过（最多等 30 秒）
-        print("⏳ 等待 Cloudflare 验证通过...")
-        cf_passed = False
-        for i in range(30):
-            page_src = sb.get_page_source() or ""
-            if 'input[name="email"]' in page_src.lower() or 'name="email"' in page_src.lower():
-                cf_passed = True
-                print(f"✅ Cloudflare 验证已通过（{i+1}s）")
-                break
-            time.sleep(1)
-        if not cf_passed:
-            print("⚠️ Cloudflare 验证可能未通过，继续尝试...")
-
-        if not _wait_login_form(sb, timeout=15):
-            print("❌ 页面未加载出登录表单")
-            cur_url = sb.get_current_url()
-            page_title = sb.get_title() or ""
-            print(f"  当前 URL: {cur_url}")
-            print(f"  当前标题: {page_title}")
-            sb.save_screenshot("login_load_fail.png")
-            continue  # 重试
-
-        _fill_and_submit(sb, email, password)
-
-        print("⏳ 等待登录跳转...")
-        for _ in range(12):
-            time.sleep(1)
-            cur_url = sb.get_current_url().split('?')[0].lower()
-            page_title = sb.get_title() or ""
-            if cur_url.startswith(f"{BASE_URL}/dashboard") or "Dashboard | KataBump" in page_title.lower():
-                break
-
+    print("⏳ 等待登录跳转...")
+    for _ in range(12):
+        time.sleep(1)
         cur_url = sb.get_current_url().split('?')[0].lower()
         page_title = sb.get_title() or ""
         if cur_url.startswith(f"{BASE_URL}/dashboard") or "Dashboard | KataBump" in page_title.lower():
-            print(f"✅ 登录成功！(URL: {sb.get_current_url()}, Title: {page_title})")
-            return True
+            break
 
-        # 登录失败：判断是否 captcha 错误
-        full_url = sb.get_current_url().lower()
-        if "error=captcha" in full_url or "captcha" in full_url:
-            print(f"⚠️ 第 {attempt} 次登录被 Cloudflare captcha 拦截，清理状态后重试...")
-            # 清 Cookie 让下一个重试拿到新验证会话
-            try:
-                sb.execute_cdp_cmd("Network.clearBrowserCookies", {})
-            except Exception:
-                try: sb.driver.delete_all_cookies()
-                except Exception: pass
-            time.sleep(2)
-            continue
-        else:
-            print(f"❌ 登录失败（非 captcha 原因），页面未跳转到账户页。(URL: {sb.get_current_url()}, Title: {page_title})")
-            sb.save_screenshot("login_failed.png")
-            return False  # 账号/密码错误，重试无意义
-
-    print("❌ 多次重试后仍登录失败")
-    sb.save_screenshot("login_failed.png")
+    cur_url = sb.get_current_url().split('?')[0].lower()
+    page_title = sb.get_title() or ""
+    if cur_url.startswith(f"{BASE_URL}/dashboard") or "Dashboard | KataBump" in page_title.lower():
+        print(f"✅ 登录成功！(URL: {sb.get_current_url()}, Title: {page_title})")
+        return True
+        
+    print(f"❌ 登录失败，页面未跳转到账户页。(URL: {sb.get_current_url()}, Title: {page_title})")
+    sb.save_screenshot(f"login_failed_{email}.png")
     return False
 
-
-# ===== 登出 =====
-
-def logout(sb):
-    """清除当前账户的登录态（清 Cookie + Storage），准备切换下一个账户"""
-    print("\n🚪 登出当前账户...")
-    try:
-        sb.execute_cdp_cmd("Network.clearBrowserCookies", {})
-    except Exception:
-        try:
-            sb.driver.delete_all_cookies()
-        except Exception:
-            pass
-
-    try:
-        sb.execute_cdp_cmd("Storage.clearDataForOrigin", {
-            "origin": BASE_URL,
-            "storageTypes": "local_storage,session_storage"
-        })
-    except Exception:
-        try:
-            sb.execute_script("localStorage.clear(); sessionStorage.clear();")
-        except Exception:
-            pass
-
-    # 用 uc_open_with_reconnect 重新走一遍 Cloudflare，
-    # 让下一个账户拿到干净的验证会话（避免被判定为同设备多账户登录）
-    try:
-        sb.uc_open_with_reconnect(BASE_URL + "/auth/login", reconnect_time=5)
-    except Exception:
-        sb.open(BASE_URL + "/auth/login")
-    time.sleep(4)
-
-    # 确认已回到登录页
-    try:
-        sb.wait_for_element('input[name="email"]', timeout=10)
-        print("✅ 已返回到登录页")
-    except Exception:
-        print("⚠️ 未检测到登录表单，强制刷新...")
-        try:
-            sb.open(BASE_URL + "/auth/login")
-        except Exception:
-            pass
-        time.sleep(3)
-
-
-# ===== Tab 辅助函数（多 Tab 复用同一浏览器） =====
-
-def _get_current_handle(sb) -> str:
-    """稳妥获取当前窗口 handle。
-
-    优先用 SeleniumBase 内置方法（uc 模式下比裸 driver 调用更稳），
-    失败时退回 list 式 window_handles[0]（会重新同步会话，比裸
-    current_window_handle 更不容易撞上 'Connection refused'）。
-    """
-    try:
-        return sb.get_current_window_handle()
-    except Exception:
-        try:
-            return sb.driver.current_window_handle
-        except Exception:
-            return sb.driver.window_handles[0]
-
-
-def _open_new_tab(sb, url: str) -> str:
-    """打开新 Tab 并切换过去，返回打开前正在用的 handle（作为锚点）。
-
-    注意：这里只开【空白】新 Tab + 清理上一账户的会话 Cookie，
-    不主动导航；真正的登录页导航交给 login() 里的
-    uc_open_with_reconnect 完成（每个账户只导航一次，避免重复触发
-    Cloudflare 被判定为机器人）。url 参数保留以兼容调用方。
-    """
-    anchor = _get_current_handle(sb)
-    try:
-        # 优先用 SeleniumBase 内置方法（更稳，会自动切到新 Tab）
-        sb.open_new_window()
-    except Exception:
-        # 兜底：JS 打开新 Tab
-        sb.execute_script(f"window.open('{url}', '_blank');")
-        sb.wait_for_new_window()
-        sb.switch_to_window(sb.driver.window_handles[-1])
-    # 切换账户前清掉上一份会话 Cookie（多 Tab 共用同一浏览器 Cookie 罐，
-    # 不清会导致账户串号；清掉后 login() 会重新走一遍 Cloudflare）
-    try:
-        sb.execute_cdp_cmd("Network.clearBrowserCookies", {})
-    except Exception:
-        try:
-            sb.driver.delete_all_cookies()
-        except Exception:
-            pass
-    time.sleep(0.5)
-    return anchor
-
-
-def _close_tab_and_return(sb, anchor: str):
-    """关闭当前 Tab、回到 anchor、清掉当前账户的会话 Cookie"""
-    try:
-        sb.close_current_window()
-    except Exception:
-        try:
-            sb.driver.close()
-        except Exception:
-            pass
-    # 切回锚点（锚点失效则回退到第一个 Tab）
-    try:
-        sb.switch_to_window(anchor)
-    except Exception:
-        try:
-            sb.switch_to_window(sb.driver.window_handles[0])
-        except Exception:
-            pass
-    try:
-        sb.execute_cdp_cmd("Network.clearBrowserCookies", {})
-    except Exception:
-        try:
-            sb.driver.delete_all_cookies()
-        except Exception:
-            pass
-    time.sleep(0.5)
-
-
-# ===== 自动续期 =====
+# ================= 自动续期流程 =================
 
 def _read_alert(sb):
     """读取页面第一个 Bootstrap alert 的文本，找不到返回空串"""
@@ -623,33 +358,16 @@ def _read_alert(sb):
     except Exception:
         return ""
 
-
-def _goto_server_detail(sb, email: str, node_link: str = "") -> bool:
-    """进入服务器详情页。
-
-    如果 node_link 有值，直接导航到该链接；
-    否则在 Dashboard 首页查找并点击 See 链接。
-    """
+def _goto_server_detail(sb, email) -> bool:
     print("\n🖥️  正在进入服务器续期页...")
     time.sleep(5)
 
-    # ===== 如果配置了 node_link，直接跳转 =====
-    if node_link:
-        print(f"🔗 使用 node_link: {node_link}")
-        sb.open(node_link)
-        time.sleep(5)
+    alert_text = _read_alert(sb)
+    if alert_text and "can't renew" in alert_text.lower():
+        print(f"ℹ️  页面顶部提示: {alert_text}")
+        send_tg_message("ℹ️", "⚠️ 未到续期时间", email, alert_text)
+        return False
 
-        # 跳转后检查是否提示"无法续期"
-        alert_text = _read_alert(sb)
-        if alert_text and "can't renew" in alert_text.lower():
-            print(f"ℹ️  页面顶部提示: {alert_text}")
-            send_tg_message("ℹ️", "⚠️ 未到续期时间", alert_text, email)
-            return False
-
-        print(f"📄 当前页面: {sb.get_current_url()}")
-        return True
-
-    # ===== 没有 node_link，走自动查找 =====
     selectors = [
         'a[href*="/servers/edit?id="]',
         'td a[href*="/servers/edit"]',
@@ -666,7 +384,6 @@ def _goto_server_detail(sb, email: str, node_link: str = "") -> bool:
         except Exception:
             continue
 
-    # 选择器全部失败，尝试通过文本内容查找
     if see_link is None:
         print("⚠️ 选择器未命中，尝试文本匹配...")
         try:
@@ -684,17 +401,7 @@ def _goto_server_detail(sb, email: str, node_link: str = "") -> bool:
         print(f"❌ 未找到 'See' 链接")
         print(f"当前 URL: {cur_url}")
         print(f"页面标题: {title}")
-        try:
-            links = sb.find_elements("a")
-            print(f"     页面共 {len(links)} 个链接:")
-            for a in links[:20]:
-                href = a.get_attribute("href") or ""
-                txt  = (a.text or "").strip()[:30]
-                if href:
-                    print(f"       - [{txt}] -> {href}")
-        except Exception:
-            pass
-        sb.save_screenshot("servers_page_fail.png")
+        sb.save_screenshot(f"servers_page_fail_{email}.png")
         return False
 
     print("🖱️  点击 'See' 进入服务器详情页...")
@@ -703,9 +410,7 @@ def _goto_server_detail(sb, email: str, node_link: str = "") -> bool:
     print(f"📄 当前页面: {sb.get_current_url()}")
     return True
 
-
 def _open_renew_modal(sb) -> bool:
-    """滚动到 Renew 按钮并点击，打开模态框"""
     print("\n🔄 查找 Renew 按钮...")
     try:
         renew_btn = sb.find_element('button[data-bs-target="#renew-modal"]', timeout=10)
@@ -736,9 +441,7 @@ def _open_renew_modal(sb) -> bool:
         print("⚠️ 模态框未弹出")
         return False
 
-
 def _solve_altcha(sb) -> bool:
-    """处理 ALTCHA 人机验证"""
     print("\n🔐 处理 ALTCHA 人机验证...")
     time.sleep(2)
 
@@ -821,12 +524,10 @@ def _solve_altcha(sb) -> bool:
         except Exception:
             pass
 
-    print("  ❌ ALTCHA 5 轮均失败")
+    print("  ❌ ALTCHA 3 轮均失败")
     return False
 
-
 def _submit_renew(sb):
-    """点击模态框内的 Renew 提交按钮"""
     print("🖱️  点击模态框中的 Renew 按钮...")
     try:
         submit = sb.find_element('div.modal.show button.btn-primary', timeout=5)
@@ -843,9 +544,7 @@ def _submit_renew(sb):
         """)
     time.sleep(3)
 
-
-def _check_renew_result(sb, email: str):
-    """读取页面 alert 提示，判断续期结果并推送 TG 通知"""
+def _check_renew_result(sb, email):
     print("\n📋 检查续期结果...")
     alert_text = _read_alert(sb)
     if not alert_text:
@@ -856,23 +555,17 @@ def _check_renew_result(sb, email: str):
         print(f"📩 页面提示: {alert_text}")
         low = alert_text.lower()
         if "can't renew" in low or "unable" in low:
-            send_tg_message("⏳", "未到续期时间", alert_text, email)
-        elif any(kw in low for kw in ("renewed", "success", "extended")):
-            send_tg_message("✅", "续期成功", alert_text, email)
+            send_tg_message("⏳", "未到续期时间", email, alert_text)
+        elif any(kw in low for kw in ( "renewed", "success", "extended")):
+            send_tg_message("✅", "续期成功", email, alert_text)
         else:
-            send_tg_message("ℹ️", "续期操作已执行", alert_text, email)
+            send_tg_message("ℹ️", "续期操作已执行", email, alert_text)
     else:
         print("ℹ️ 未检测到明确的提示框，可能续期操作未生效")
-        send_tg_message("ℹ️", "续期操作已执行", "未检测到明确提示", email)
+        send_tg_message("ℹ️", "续期操作已执行", email, "未检测到明确提示")
 
-
-def renew_server(sb, email: str, node_link: str = ""):
-    """登录成功后调用：自动进入详情页 -> Renew -> ALTCHA -> 提交"""
-    print("\n" + "#" * 25)
-    print(f"  开始自动续期: {mask_email(email)}")
-    print("#" * 25)
-
-    if not _goto_server_detail(sb, email, node_link):
+def renew_server(sb, email):
+    if not _goto_server_detail(sb, email):
         return
 
     if not _open_renew_modal(sb):
@@ -885,109 +578,62 @@ def renew_server(sb, email: str, node_link: str = ""):
     _submit_renew(sb)
     _check_renew_result(sb, email)
 
-
-# ===== 脚本入口 =====
-
+# ================= 脚本执行入口 =================
 def main():
-    print("#" * 30)
-    print("   Katabump 多账户自动续期（多 Tab 版本）")
-    print("#" * 30)
+    print("#" * 35)
+    print("   katabump 自动登录续期 (多账号版)")
+    print("#" * 35)
 
-    # 加载账户列表
-    accounts = load_accounts()
+    accounts = get_accounts()
     if not accounts:
-        print("❌ 没有有效账户，程序退出。")
+        print("❌ 未发现任何账号配置，请配置 KATABUMP_ACCOUNTS 或 KATABUMP_EMAIL。")
         return
 
-    # 代理配置（全局生效）
+    print(f"📦 共检测到 {len(accounts)} 个待续期账号。")
+
     IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
     proxy_str = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1081"
-
-    # 统计
-    total = len(accounts)
-    success_count = 0
-    fail_count = 0
-
-    # ===== 多 Tab：整场只开一次浏览器（不再用 incognito，复用同一窗口） =====
     sb_kwargs = {"uc": True, "headless": False}
+
     if IS_PROXY:
         print(f"🔗 挂载代理: {proxy_str}")
         sb_kwargs["proxy"] = proxy_str
     else:
         print("🌐 未使用代理，直连访问")
 
-    with SB(**sb_kwargs) as sb:
-        # ===== 先稳稳拿到初始 Tab 锚点（在任何外部导航之前！）=====
-        # 否则像 GitHub Actions 上那样：先 sb.open 外部页 → driver 会话
-        # 进入不稳定/重连态 → 紧接着裸 current_window_handle 直接撞上
-        # 'Connection refused'。这里用 _get_current_handle 兜底。
-        try:
-            anchor = _get_current_handle(sb)
-        except Exception as e:
-            print(f"⚠️ 初始化窗口句柄失败（浏览器会话可能已断开）: {e}")
-            return
+    # 循环处理每个账号
+    for idx, account in enumerate(accounts):
+        email = account.get("email", "").strip()
+        password = account.get("password", "").strip()
 
-        # 显示出口 IP（非必需，独立 try/except，失败不致命）
-        try:
-            sb.open("https://api.ip.sb/ip")
-            print(f"🌐 当前出口IP: {sb.get_text('body')}")
-        except Exception as e:
-            print(f"⚠️ 出口IP检查失败（忽略）: {e}")
+        if not email or not password:
+            print(f"\n⚠️ 第 {idx + 1} 个账号缺少邮箱或密码，已跳过。")
+            continue
 
-        for idx, acct in enumerate(accounts, start=1):
-            email     = acct["email"]
-            password  = acct["password"]
-            node_link = acct.get("node_link", "")
+        print("\n" + "=" * 45)
+        print(f"🚀 开始执行账号 [{idx + 1}/{len(accounts)}]: {email}")
+        print("=" * 45)
 
-            if node_link:
-                print(f"   🔗 已配置 node_link")
-
-            print("\n" + "=" * 40)
-            print(f"📌 正在处理第 {idx}/{total} 个账户: {mask_email(email)}")
-            print("=" * 40)
-
+        # 每次新开一个干净的无头浏览器实例，避免上一个账号缓存影响
+        with SB(**sb_kwargs) as sb:
             try:
-                if idx > 1:
-                    # ===== 第 2 个起：开新 Tab（含清上一账户 Cookie），
-                    # login() 内部会负责单此导航到登录页 =====
-                    print("🪟 打开新标签页处理下一账户...")
-                    anchor = _open_new_tab(sb, BASE_URL + "/auth/login")
-                # 第一个账户：不预开登录页，直接交给 login() 导航一次
+                sb.open("https://api.ip.sb/ip")
+                print(f"📍  当前出口IP: {sb.get_text('body')}")
+            except Exception:
+                pass
 
-                # 登录（login() 内部用 uc_open_with_reconnect 单此导航）
-                if not login(sb, email, password):
-                    print(f"\n❌ 账户 [{mask_email(email)}] 登录失败，跳过续期。")
-                    send_tg_message("❌", "登录失败", "未知", email)
-                    fail_count += 1
-                    # 登录失败的 Tab 关掉，回到锚点
-                    if idx > 1:
-                        _close_tab_and_return(sb, anchor)
-                    continue
+            if login(sb, email, password):
+                renew_server(sb, email)  # 登录成功后自动续期
+            else:
+                print(f"\n❌ 账号 {email} 登录失败，终止后续操作。")
+                send_tg_message("❌", "登录失败", email, "未知")
 
-                # 续期
-                renew_server(sb, email, node_link)
-                success_count += 1
-
-            except Exception as e:
-                print(f"\n❌ 账户 [{mask_email(email)}] 处理异常: {e}")
-                send_tg_message("❌", "运行异常", str(e)[:200], email)
-                fail_count += 1
-                # 异常 Tab 关掉，回到锚点，避免空 Tab 堆积
-                try:
-                    if idx > 1:
-                        _close_tab_and_return(sb, anchor)
-                except Exception:
-                    pass
-                continue
-
-        # 最终统计
-        print("\n" + "=" * 40)
-        print(f"📊 执行完毕: 共 {total} 个账户")
-        print(f"   ✅ 成功: {success_count}")
-        print(f"   ❌ 失败: {fail_count}")
-        print("=" * 40)
-        print("🪟 浏览器保持打开，方便人工核对续期结果（如需关闭请手动关闭）。")
-
+        # 若还有下一个账号，在此等待一段时间防止被盾拉黑
+        if idx < len(accounts) - 1:
+            print("\n⏳ 浏览器已销毁，等待 15 秒后启动下一个账号...")
+            time.sleep(15)
+            
+    print("\n🎉 所有账号续期任务执行完毕！")
 
 if __name__ == "__main__":
     main()
