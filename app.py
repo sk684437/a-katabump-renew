@@ -422,18 +422,12 @@ def _fill_and_submit(sb, email: str, password: str) -> None:
 
 def login(sb, email: str, password: str, max_retry: int = 3) -> bool:
     """登录账户，提交后若遇 Cloudflare captcha 错误自动重试。
-    会在每个账户登录前清理上一个账户的会话 Cookie（多 Tab 复用浏览器时必需）。
-    """
-    # ===== 多 Tab 复用同一浏览器：切换账户前清掉上一份会话 Cookie =====
-    try:
-        sb.execute_cdp_cmd("Network.clearBrowserCookies", {})
-    except Exception:
-        try:
-            sb.driver.delete_all_cookies()
-        except Exception:
-            pass
-    time.sleep(0.5)
 
+    注意：本函数内部只用 uc_open_with_reconnect 导航【一次】到登录页，
+    不要在函数开头清 Cookie——那会抹掉刚刚建立的 cf_clearance，
+    导致紧接着的二次导航被 Cloudflare 判定为机器人。账户之间的
+    Cookie 隔离交给 _open_new_tab（切换账户时清空）处理。
+    """
     for attempt in range(1, max_retry + 1):
         print(f"\n🌐 [尝试 {attempt}/{max_retry}] 打开登录页面: {BASE_URL}/auth/login")
         sb.uc_open_with_reconnect(BASE_URL + "/auth/login", reconnect_time=5)
@@ -563,7 +557,13 @@ def _get_current_handle(sb) -> str:
 
 
 def _open_new_tab(sb, url: str) -> str:
-    """打开新 Tab 并切换过去，返回打开前正在用的 handle（作为锚点）"""
+    """打开新 Tab 并切换过去，返回打开前正在用的 handle（作为锚点）。
+
+    注意：这里只开【空白】新 Tab + 清理上一账户的会话 Cookie，
+    不主动导航；真正的登录页导航交给 login() 里的
+    uc_open_with_reconnect 完成（每个账户只导航一次，避免重复触发
+    Cloudflare 被判定为机器人）。url 参数保留以兼容调用方。
+    """
     anchor = _get_current_handle(sb)
     try:
         # 优先用 SeleniumBase 内置方法（更稳，会自动切到新 Tab）
@@ -573,14 +573,16 @@ def _open_new_tab(sb, url: str) -> str:
         sb.execute_script(f"window.open('{url}', '_blank');")
         sb.wait_for_new_window()
         sb.switch_to_window(sb.driver.window_handles[-1])
-    # 在新 Tab 里打开目标 URL
+    # 切换账户前清掉上一份会话 Cookie（多 Tab 共用同一浏览器 Cookie 罐，
+    # 不清会导致账户串号；清掉后 login() 会重新走一遍 Cloudflare）
     try:
-        sb.open(url)
+        sb.execute_cdp_cmd("Network.clearBrowserCookies", {})
     except Exception:
         try:
-            sb.execute_script(f"window.location.href='{url}';")
+            sb.driver.delete_all_cookies()
         except Exception:
             pass
+    time.sleep(0.5)
     return anchor
 
 
@@ -945,16 +947,14 @@ def main():
             print("=" * 40)
 
             try:
-                if idx == 1:
-                    # ===== 第一个账户：直接在当前 Tab 打开登录页 =====
-                    sb.open(BASE_URL + "/auth/login")
-                    time.sleep(2)
-                else:
-                    # ===== 第 2 个起：开新 Tab，回到 anchor 作为切换基准 =====
+                if idx > 1:
+                    # ===== 第 2 个起：开新 Tab（含清上一账户 Cookie），
+                    # login() 内部会负责单此导航到登录页 =====
                     print("🪟 打开新标签页处理下一账户...")
                     anchor = _open_new_tab(sb, BASE_URL + "/auth/login")
+                # 第一个账户：不预开登录页，直接交给 login() 导航一次
 
-                # 登录
+                # 登录（login() 内部用 uc_open_with_reconnect 单此导航）
                 if not login(sb, email, password):
                     print(f"\n❌ 账户 [{mask_email(email)}] 登录失败，跳过续期。")
                     send_tg_message("❌", "登录失败", "未知", email)
