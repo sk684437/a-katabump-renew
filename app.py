@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Katabump 多账户自动续期脚本
+Katabump 多账户自动续期脚本（多 Tab 版本）
 支持从环境变量 ACCOUNTS_JSON 或 accounts.json 读取多个账户
-同一浏览器循环登录 + 续期
+复用同一个浏览器窗口，每个账户开一个 Tab，顺序登录 + 续期
 """
 
 import json
@@ -421,7 +421,19 @@ def _fill_and_submit(sb, email: str, password: str) -> None:
 
 
 def login(sb, email: str, password: str, max_retry: int = 3) -> bool:
-    """登录账户，提交后若遇 Cloudflare captcha 错误自动重试"""
+    """登录账户，提交后若遇 Cloudflare captcha 错误自动重试。
+    会在每个账户登录前清理上一个账户的会话 Cookie（多 Tab 复用浏览器时必需）。
+    """
+    # ===== 多 Tab 复用同一浏览器：切换账户前清掉上一份会话 Cookie =====
+    try:
+        sb.execute_cdp_cmd("Network.clearBrowserCookies", {})
+    except Exception:
+        try:
+            sb.driver.delete_all_cookies()
+        except Exception:
+            pass
+    time.sleep(0.5)
+
     for attempt in range(1, max_retry + 1):
         print(f"\n🌐 [尝试 {attempt}/{max_retry}] 打开登录页面: {BASE_URL}/auth/login")
         sb.uc_open_with_reconnect(BASE_URL + "/auth/login", reconnect_time=5)
@@ -530,6 +542,34 @@ def logout(sb):
         except Exception:
             pass
         time.sleep(3)
+
+
+# ===== Tab 辅助函数（多 Tab 复用同一浏览器） =====
+
+def _open_new_tab(sb, url: str) -> str:
+    """打开新 Tab 并切换过去，返回打开前正在用的 handle（作为锚点）"""
+    anchor = sb.driver.current_window_handle
+    sb.execute_script(f"window.open('{url}', '_blank');")
+    sb.wait_for_new_window()  # SeleniumBase 内置：等待新窗口出现
+    sb.switch_to_window(sb.driver.window_handles[-1])
+    return anchor
+
+
+def _close_tab_and_return(sb, anchor: str):
+    """关闭当前 Tab、回到 anchor、清掉当前账户的会话 Cookie"""
+    try:
+        sb.driver.close()
+    except Exception:
+        pass
+    sb.switch_to_window(anchor)
+    try:
+        sb.execute_cdp_cmd("Network.clearBrowserCookies", {})
+    except Exception:
+        try:
+            sb.driver.delete_all_cookies()
+        except Exception:
+            pass
+    time.sleep(0.5)
 
 
 # ===== 自动续期 =====
@@ -809,7 +849,7 @@ def renew_server(sb, email: str, node_link: str = ""):
 
 def main():
     print("#" * 30)
-    print("   Katabump 多账户自动续期")
+    print("   Katabump 多账户自动续期（多 Tab 版本）")
     print("#" * 30)
 
     # 加载账户列表
@@ -827,63 +867,80 @@ def main():
     success_count = 0
     fail_count = 0
 
-    for idx, acct in enumerate(accounts, start=1):
-        email    = acct["email"]
-        password = acct["password"]
-        node_link = acct.get("node_link", "")
+    # ===== 多 Tab：整场只开一次浏览器（不再用 incognito，复用同一窗口） =====
+    sb_kwargs = {"uc": True, "headless": False}
+    if IS_PROXY:
+        print(f"🔗 挂载代理: {proxy_str}")
+        sb_kwargs["proxy"] = proxy_str
+    else:
+        print("🌐 未使用代理，直连访问")
 
-        if node_link:
-            print(f"   🔗 已配置 node_link")
-
-        print("\n" + "=" * 40)
-        print(f"📌 正在处理第 {idx}/{total} 个账户: {mask_email(email)}")
-        print("=" * 40)
-
-        # 每个账户独立浏览器上下文：
-        # 账户1 用普通窗口，账户2起用隐身窗口(incognito)彻底隔离 Cloudflare 状态
-        sb_kwargs = {"uc": True, "headless": False}
-        if idx > 1:
-            sb_kwargs["incognito"] = True
-            print("🕶️ 使用隐身窗口（隔离 Cloudflare 会话）")
-        if IS_PROXY:
-            print(f"🔗 挂载代理: {proxy_str}")
-            sb_kwargs["proxy"] = proxy_str
-        else:
-            print("🌐 未使用代理，直连访问")
-
+    with SB(**sb_kwargs) as sb:
+        # 显示出口 IP（只在开场打印一次）
         try:
-            with SB(**sb_kwargs) as sb:
-                # 显示出口 IP
-                try:
-                    sb.open("https://api.ip.sb/ip")
-                    print(f"🌐 当前出口IP: {sb.get_text('body')}")
-                except Exception:
-                    pass
+            sb.open("https://api.ip.sb/ip")
+            print(f"🌐 当前出口IP: {sb.get_text('body')}")
+        except Exception:
+            pass
+
+        # 锚点：记录开第一笔账户前所在的 Tab handle
+        anchor = sb.driver.current_window_handle
+
+        for idx, acct in enumerate(accounts, start=1):
+            email     = acct["email"]
+            password  = acct["password"]
+            node_link = acct.get("node_link", "")
+
+            if node_link:
+                print(f"   🔗 已配置 node_link")
+
+            print("\n" + "=" * 40)
+            print(f"📌 正在处理第 {idx}/{total} 个账户: {mask_email(email)}")
+            print("=" * 40)
+
+            try:
+                if idx == 1:
+                    # ===== 第一个账户：直接在当前 Tab 打开登录页 =====
+                    sb.open(BASE_URL + "/auth/login")
+                    time.sleep(2)
+                else:
+                    # ===== 第 2 个起：开新 Tab，回到 anchor 作为切换基准 =====
+                    print("🪟 打开新标签页处理下一账户...")
+                    anchor = _open_new_tab(sb, BASE_URL + "/auth/login")
 
                 # 登录
                 if not login(sb, email, password):
                     print(f"\n❌ 账户 [{mask_email(email)}] 登录失败，跳过续期。")
                     send_tg_message("❌", "登录失败", "未知", email)
                     fail_count += 1
-                    continue  # 下一账户会开新浏览器，无需登出
+                    # 登录失败的 Tab 关掉，回到锚点
+                    if idx > 1:
+                        _close_tab_and_return(sb, anchor)
+                    continue
 
                 # 续期
                 renew_server(sb, email, node_link)
-
                 success_count += 1
 
-        except Exception as e:
-            print(f"\n❌ 账户 [{mask_email(email)}] 处理异常: {e}")
-            send_tg_message("❌", "运行异常", str(e)[:200], email)
-            fail_count += 1
-            continue
+            except Exception as e:
+                print(f"\n❌ 账户 [{mask_email(email)}] 处理异常: {e}")
+                send_tg_message("❌", "运行异常", str(e)[:200], email)
+                fail_count += 1
+                # 异常 Tab 关掉，回到锚点，避免空 Tab 堆积
+                try:
+                    if idx > 1:
+                        _close_tab_and_return(sb, anchor)
+                except Exception:
+                    pass
+                continue
 
-    # 最终统计
-    print("\n" + "=" * 40)
-    print(f"📊 执行完毕: 共 {total} 个账户")
-    print(f"   ✅ 成功: {success_count}")
-    print(f"   ❌ 失败: {fail_count}")
-    print("=" * 40)
+        # 最终统计
+        print("\n" + "=" * 40)
+        print(f"📊 执行完毕: 共 {total} 个账户")
+        print(f"   ✅ 成功: {success_count}")
+        print(f"   ❌ 失败: {fail_count}")
+        print("=" * 40)
+        print("🪟 浏览器保持打开，方便人工核对续期结果（如需关闭请手动关闭）。")
 
 
 if __name__ == "__main__":
