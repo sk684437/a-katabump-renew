@@ -35,10 +35,17 @@ jobs:
 
     - name: 🚀 运行续期脚本
       env:
+        # 多账号模式（可选）：格式：email1:pass1,email2:pass2
+        # 若未设置此 Secret，脚本自动回退到单账号模式（KATABUMP_EMAIL + KATABUMP_PASSWORD）
+        KATABUMP_ACCOUNTS: ${{ secrets.KATABUMP_ACCOUNTS }}
+        # 单账号模式（保留兼容）
         KATABUMP_EMAIL: ${{ secrets.KATABUMP_EMAIL }}
         KATABUMP_PASSWORD: ${{ secrets.KATABUMP_PASSWORD }}
+        # Telegram 通知
         TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        # 账号间延迟（可选，默认15秒）
+        ACCOUNT_DELAY: ${{ secrets.ACCOUNT_DELAY }}
       run: |
         xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
           python3 app.py
