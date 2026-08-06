@@ -586,6 +586,7 @@ def renew_server(sb):
 
 # ===== 主入口（支持多账号） =====
 def main():
+    global EMAIL, PASSWORD  # 声明为全局变量，以便修改它们
     print("#" * 35)
     print("   katabump 自动登录续期（多账号版）")
     print("#" * 35)
@@ -608,7 +609,6 @@ def main():
             return
     else:
         # 兼容旧的单账号模式
-        global EMAIL, PASSWORD
         if EMAIL and PASSWORD:
             account_list = [(EMAIL, PASSWORD)]
         else:
@@ -635,7 +635,6 @@ def main():
         print(f"{'='*50}")
 
         # 更新全局账号，供 login/renew/send_tg_message 使用
-        global EMAIL, PASSWORD  # 注意：这里再次用 global 会报错？实际上在函数外已经声明，但函数内还需要声明才能赋值
         EMAIL = email
         PASSWORD = password
 
@@ -662,6 +661,6 @@ def main():
             time.sleep(delay)
 
     print(f"\n🎉 所有账号续期任务执行完毕！")
-
+    
 if __name__ == "__main__":
     main()
