@@ -454,4 +454,214 @@ def _solve_altcha(sb) -> bool:
 
     for attempt in range(3):
         if sb.execute_script(_ALTCHA_SOLVED_JS):
-            print(f"✅ ALTCHA 验证
+            print(f"✅ ALTCHA 验证通过（第 {attempt + 1} 轮）")
+            return True
+
+        # 尝试通过 xdotool 物理点击 iframe 坐标
+        if coords:
+            try:
+                wi = sb.execute_script(_WININFO_JS)
+            except Exception:
+                wi = {"sx": 0, "sy": 0, "oh": 800, "ih": 768}
+            bar = wi["oh"] - wi["ih"]
+            ax  = coords["cx"] + wi["sx"]
+            ay  = coords["cy"] + wi["sy"] + bar
+            print(f"🖱️  ALTCHA点击复选框  ({ax}, {ay})")
+            _xdotool_click(ax, ay)
+
+        # 尝试通过 SeleniumBase 原生点击模态框内 iframe
+        try:
+            iframes = sb.find_elements('div.modal.show iframe')
+            for iframe in iframes:
+                try:
+                    iframe.click()
+                    print("🖱️  SeleniumBase 点击模态框 iframe")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # JS 遍历点击所有可点击元素
+        sb.execute_script("""
+            (function(){
+                var modal = document.querySelector('div.modal.show');
+                if (!modal) return;
+                var iframes = modal.querySelectorAll('iframe');
+                for (var i = 0; i < iframes.length; i++) {
+                    iframes[i].click();
+                    iframes[i].dispatchEvent(new MouseEvent('click', {bubbles:true}));
+                }
+                var labels = modal.querySelectorAll('label');
+                for (var j = 0; j < labels.length; j++) {
+                    var txt = (labels[j].textContent || '').toLowerCase();
+                    if (txt.includes('robot') || txt.includes('captcha') || txt.includes('verify'))
+                        labels[j].click();
+                }
+                var cbs = modal.querySelectorAll('input[type="checkbox"]');
+                for (var k = 0; k < cbs.length; k++) {
+                    if (!cbs[k].disabled) {
+                        cbs[k].click();
+                        cbs[k].dispatchEvent(new MouseEvent('click', {bubbles:true}));
+                    }
+                }
+            })()
+        """)
+
+        # 等待验证结果
+        for _ in range(6):
+            time.sleep(1)
+            if sb.execute_script(_ALTCHA_SOLVED_JS):
+                print(f"✅ ALTCHA 验证通过（第 {attempt + 1} 轮）")
+                return True
+
+        print(f"  ⚠️ 第 {attempt + 1} 轮未通过，重试...")
+        # 重新获取 iframe 坐标（可能重新渲染）
+        try:
+            new_coords = sb.execute_script(_ALTCHA_EXPAND_JS)
+            if new_coords:
+                coords = new_coords
+        except Exception:
+            pass
+
+    print("  ❌ ALTCHA 3 轮均失败")
+    return False
+
+def _submit_renew(sb):
+    """点击模态框内的 Renew 提交按钮"""
+    print("🖱️  点击模态框中的 Renew 按钮...")
+    try:
+        submit = sb.find_element('div.modal.show button.btn-primary', timeout=5)
+        submit.click()
+    except Exception:
+        sb.execute_script("""
+            (function(){
+                var m = document.querySelector('div.modal.show');
+                if (!m) return;
+                var bs = m.querySelectorAll('button');
+                for (var i = 0; i < bs.length; i++)
+                    if (/renew/i.test(bs[i].textContent)) bs[i].click();
+            })()
+        """)
+    time.sleep(3)
+
+def _check_renew_result(sb):
+    """读取页面 alert 提示，判断续期结果并推送 TG 通知"""
+    print("\n📋 检查续期结果...")
+    alert_text = _read_alert(sb)
+    if not alert_text:
+        time.sleep(3)
+        alert_text = _read_alert(sb)
+
+    if alert_text:
+        print(f"📩 页面提示: {alert_text}")
+        low = alert_text.lower()
+        if "can't renew" in low or "unable" in low:
+            send_tg_message("⏳", "未到续期时间", alert_text)
+        elif any(kw in low for kw in ("renewed", "success", "extended")):
+            send_tg_message("✅", "续期成功", alert_text)
+        else:
+            send_tg_message("ℹ️", "续期操作已执行", alert_text)
+    else:
+        print("ℹ️ 未检测到明确的提示框，可能续期操作未生效")
+        send_tg_message("ℹ️", "续期操作已执行", "未检测到明确提示")
+
+def renew_server(sb):
+    """登录成功后调用：自动进入详情页 -> Renew -> ALTCHA -> 提交"""
+    print("\n" + "#" * 25)
+    print("  开始自动续期流程")
+    print("#" * 25)
+
+    if not _goto_server_detail(sb):
+        return
+
+    if not _open_renew_modal(sb):
+        return
+
+    altcha_ok = _solve_altcha(sb)
+    if not altcha_ok:
+        print("⚠️ ALTCHA 验证未通过，仍尝试提交 Renew...")
+
+    _submit_renew(sb)
+    _check_renew_result(sb)
+
+# ===== 主入口（支持多账号） =====
+def main():
+    print("#" * 35)
+    print("   katabump 自动登录续期（多账号版）")
+    print("#" * 35)
+
+    # 读取多账号环境变量，格式: email1:pass1,email2:pass2
+    accounts_env = os.environ.get("KATABUMP_ACCOUNTS", "").strip()
+    account_list = []
+
+    if accounts_env:
+        # 多账号模式
+        for item in accounts_env.split(","):
+            item = item.strip()
+            if ":" in item:
+                email, pwd = item.split(":", 1)
+                account_list.append((email.strip(), pwd.strip()))
+            else:
+                print(f"⚠️ 忽略无效账号配置: {item}")
+        if not account_list:
+            print("❌ KATABUMP_ACCOUNTS 格式错误，请使用 email:password 并用逗号分隔")
+            return
+    else:
+        # 兼容旧的单账号模式
+        global EMAIL, PASSWORD
+        if EMAIL and PASSWORD:
+            account_list = [(EMAIL, PASSWORD)]
+        else:
+            print("❌ 未配置账号。请设置 KATABUMP_EMAIL 和 KATABUMP_PASSWORD，或设置 KATABUMP_ACCOUNTS。")
+            return
+
+    print(f"📦 共检测到 {len(account_list)} 个待续期账号。\n")
+
+    # 代理配置（与原逻辑一致）
+    IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
+    proxy_str = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1081"
+    sb_kwargs = {"uc": True, "headless": False}
+
+    if IS_PROXY:
+        print(f"🔗 挂载代理: {proxy_str}")
+        sb_kwargs["proxy"] = proxy_str
+    else:
+        print("🌐 未使用代理，直连访问")
+
+    # 依次处理每个账号
+    for idx, (email, password) in enumerate(account_list, 1):
+        print(f"\n{'='*50}")
+        print(f"🚀 开始执行账号 ***{idx}/{len(account_list)}***: {email}")
+        print(f"{'='*50}")
+
+        # 更新全局账号，供 login/renew/send_tg_message 使用
+        global EMAIL, PASSWORD  # 注意：这里再次用 global 会报错？实际上在函数外已经声明，但函数内还需要声明才能赋值
+        EMAIL = email
+        PASSWORD = password
+
+        print("🚀 启动浏览器...")
+        with SB(**sb_kwargs) as sb:
+            # 获取当前出口IP
+            try:
+                sb.open("https://api.ip.sb/ip")
+                print(f"📍  当前出口IP: {sb.get_text('body')}")
+            except Exception:
+                pass
+
+            # 登录并自动续期
+            if login(sb):
+                renew_server(sb)
+            else:
+                print(f"\n❌ 账号 {email} 登录失败，终止后续操作。")
+                send_tg_message("❌", "登录失败", "未知")
+
+        # 账号间等待（最后一个账号不等待）
+        if idx < len(account_list):
+            delay = 15  # 可根据需要修改
+            print(f"\n⏳ 浏览器已销毁，等待 {delay} 秒后启动下一个账号...")
+            time.sleep(delay)
+
+    print(f"\n🎉 所有账号续期任务执行完毕！")
+
+if __name__ == "__main__":
+    main()
