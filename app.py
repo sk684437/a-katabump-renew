@@ -106,8 +106,6 @@ _WININFO_JS = """
 })()
 """
 
-# ===== 自动续期相关 =====
-
 # 在模态框内查找 iframe 并展开，返回点击坐标
 _ALTCHA_EXPAND_JS = """
 (function() {
@@ -219,7 +217,6 @@ def handle_turnstile(sb) -> bool:
         time.sleep(0.5)
 
     # 使用 SeleniumBase 内置 uc_gui_click_captcha 处理 Turnstile
-    # 该方法自动完成：检测验证码类型 → 定位 iframe → 计算坐标 → PyAutoGUI 平滑点击
     for attempt in range(6):
         if sb.execute_script(_SOLVED_JS):
             print(f"✅ Turnstile 通过（第 {attempt} 次尝试）")
@@ -231,7 +228,6 @@ def handle_turnstile(sb) -> bool:
         except Exception as e:
             print(f"⚠️ uc_gui_click_captcha 调用异常: {e}")
 
-        # 等待验证结果（最多 8 秒）
         for _ in range(16):
             time.sleep(0.5)
             if sb.execute_script(_SOLVED_JS):
@@ -265,7 +261,6 @@ def login(sb) -> bool:
     try:
         sb.wait_for_element('input[name="email"]', timeout=15)
     except Exception:
-        # 尝试大写选择器作为后备
         try:
             sb.wait_for_element('input[name="Email"]', timeout=5)
         except Exception:
@@ -344,20 +339,17 @@ def _read_alert(sb):
     except Exception:
         return ""
 
-
 def _goto_server_detail(sb) -> bool:
     """在 Dashboard 首页查找并点击 See 进入服务器详情页"""
     print("\n🖥️  正在进入服务器续期页...")
     time.sleep(5)
 
-    # 检查页面顶部是否已有"还无法续期"全局提示
     alert_text = _read_alert(sb)
     if alert_text and "can't renew" in alert_text.lower():
         print(f"ℹ️  页面顶部提示: {alert_text}")
         send_tg_message("ℹ️", "⚠️ 未到续期时间", alert_text)
         return False
 
-    # 多种选择器尝试查找 See 链接
     selectors = [
         'a[href*="/servers/edit?id="]',
         'td a[href*="/servers/edit"]',
@@ -374,7 +366,6 @@ def _goto_server_detail(sb) -> bool:
         except Exception:
             continue
 
-    # 选择器全部失败，尝试通过文本内容查找
     if see_link is None:
         print("⚠️ 选择器未命中，尝试文本匹配...")
         try:
@@ -387,7 +378,6 @@ def _goto_server_detail(sb) -> bool:
             pass
 
     if see_link is None:
-        # 打印调试信息帮助排查
         cur_url = sb.get_current_url()
         title = sb.get_title() or ""
         print(f"❌ 未找到 'See' 链接")
@@ -411,7 +401,6 @@ def _goto_server_detail(sb) -> bool:
     time.sleep(5)
     print(f"📄 当前页面: {sb.get_current_url()}")
     return True
-
 
 def _open_renew_modal(sb) -> bool:
     """滚动到 Renew 按钮并点击，打开模态框"""
@@ -445,18 +434,15 @@ def _open_renew_modal(sb) -> bool:
         print("⚠️ 模态框未弹出")
         return False
 
-
 def _solve_altcha(sb) -> bool:
     """处理 ALTCHA 人机验证"""
     print("\n🔐 处理 ALTCHA 人机验证...")
     time.sleep(2)
 
-    # 先检查是否已自动通过
     if sb.execute_script(_ALTCHA_SOLVED_JS):
         print("✅ ALTCHA 已自动通过")
         return True
 
-    # 展开模态框内 iframe 并获取坐标
     coords = None
     try:
         coords = sb.execute_script(_ALTCHA_EXPAND_JS)
@@ -466,176 +452,6 @@ def _solve_altcha(sb) -> bool:
     if coords:
         print(f"  📍 找到模态框内 iframe 坐标: ({coords['cx']}, {coords['cy']})")
 
-    # 最多尝试 3 轮
     for attempt in range(3):
         if sb.execute_script(_ALTCHA_SOLVED_JS):
-            print(f"✅ ALTCHA 验证通过（第 {attempt + 1} 轮）")
-            return True
-
-        # 策略 1: xdotool 物理点击 iframe 坐标
-        if coords:
-            try:
-                wi = sb.execute_script(_WININFO_JS)
-            except Exception:
-                wi = {"sx": 0, "sy": 0, "oh": 800, "ih": 768}
-            bar = wi["oh"] - wi["ih"]
-            ax  = coords["cx"] + wi["sx"]
-            ay  = coords["cy"] + wi["sy"] + bar
-            print(f"🖱️  ALTCHA点击复选框  ({ax}, {ay})")
-            _xdotool_click(ax, ay)
-
-        # 策略 2: SeleniumBase 原生点击模态框内 iframe 元素
-        try:
-            iframes = sb.find_elements('div.modal.show iframe')
-            for iframe in iframes:
-                try:
-                    iframe.click()
-                    print("🖱️  SeleniumBase 点击模态框 iframe")
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # 策略 3: JS 遍历模态框内所有可点击元素
-        sb.execute_script("""
-            (function(){
-                var modal = document.querySelector('div.modal.show');
-                if (!modal) return;
-                // 点击 iframe
-                var iframes = modal.querySelectorAll('iframe');
-                for (var i = 0; i < iframes.length; i++) {
-                    iframes[i].click();
-                    iframes[i].dispatchEvent(new MouseEvent('click', {bubbles:true}));
-                }
-                // 点击含 checkbox 的 label
-                var labels = modal.querySelectorAll('label');
-                for (var j = 0; j < labels.length; j++) {
-                    var txt = (labels[j].textContent || '').toLowerCase();
-                    if (txt.includes('robot') || txt.includes('captcha') || txt.includes('verify'))
-                        labels[j].click();
-                }
-                // 点击 checkbox
-                var cbs = modal.querySelectorAll('input[type="checkbox"]');
-                for (var k = 0; k < cbs.length; k++) {
-                    if (!cbs[k].disabled) {
-                        cbs[k].click();
-                        cbs[k].dispatchEvent(new MouseEvent('click', {bubbles:true}));
-                    }
-                }
-            })()
-        """)
-
-        # 等待验证结果
-        for _ in range(6):
-            time.sleep(1)
-            if sb.execute_script(_ALTCHA_SOLVED_JS):
-                print(f"✅ ALTCHA 验证通过（第 {attempt + 1} 轮）")
-                return True
-
-        print(f"  ⚠️ 第 {attempt + 1} 轮未通过，重试...")
-        # 重新获取坐标（iframe 可能已重新渲染）
-        try:
-            new_coords = sb.execute_script(_ALTCHA_EXPAND_JS)
-            if new_coords:
-                coords = new_coords
-        except Exception:
-            pass
-
-    print("  ❌ ALTCHA 3 轮均失败")
-    return False
-
-
-def _submit_renew(sb):
-    """点击模态框内的 Renew 提交按钮"""
-    print("🖱️  点击模态框中的 Renew 按钮...")
-    try:
-        submit = sb.find_element('div.modal.show button.btn-primary', timeout=5)
-        submit.click()
-    except Exception:
-        sb.execute_script("""
-            (function(){
-                var m = document.querySelector('div.modal.show');
-                if (!m) return;
-                var bs = m.querySelectorAll('button');
-                for (var i = 0; i < bs.length; i++)
-                    if (/renew/i.test(bs[i].textContent)) bs[i].click();
-            })()
-        """)
-    time.sleep(3)
-
-
-def _check_renew_result(sb):
-    """读取页面 alert 提示，判断续期结果并推送 TG 通知"""
-    print("\n📋 检查续期结果...")
-    alert_text = _read_alert(sb)
-    if not alert_text:
-        time.sleep(3)
-        alert_text = _read_alert(sb)
-
-    if alert_text:
-        print(f"📩 页面提示: {alert_text}")
-        low = alert_text.lower()
-        if "can't renew" in low or "unable" in low:
-            send_tg_message("⏳", "未到续期时间", alert_text)
-        elif any(kw in low for kw in ( "renewed", "success", "extended")):
-            send_tg_message("✅", "续期成功", alert_text)
-        else:
-            send_tg_message("ℹ️", "续期操作已执行", alert_text)
-    else:
-        print("ℹ️ 未检测到明确的提示框，可能续期操作未生效")
-        send_tg_message("ℹ️", "续期操作已执行", "未检测到明确提示")
-
-
-def renew_server(sb):
-    """登录成功后调用：自动进入详情页 -> Renew -> ALTCHA -> 提交"""
-    print("\n" + "#" * 25)
-    print("  开始自动续期流程")
-    print("#" * 25)
-
-    if not _goto_server_detail(sb):
-        return
-
-    if not _open_renew_modal(sb):
-        return
-
-    altcha_ok = _solve_altcha(sb)
-    if not altcha_ok:
-        print("⚠️ ALTCHA 验证未通过，仍尝试提交 Renew...")
-
-    _submit_renew(sb)
-    _check_renew_result(sb)
-
-
-#  脚本执行入口 (可选代理)
-def main():
-    print("#" * 25)
-    print("   katabump 自动登录续期")
-    print("#" * 25)
-
-    IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
-    proxy_str = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1081"
-    sb_kwargs = {"uc": True, "headless": False}
-
-    if IS_PROXY:
-        print(f"🔗 挂载代理: {proxy_str}")
-        sb_kwargs["proxy"] = proxy_str
-    else:
-        print("🌐 未使用代理，直连访问")
-    
-    print("🚀 启动浏览器...")
-    with SB(**sb_kwargs) as sb:
-        # print("✅ 浏览器已启动")
-        try:
-            sb.open("https://api.ip.sb/ip")
-            print(f"📍  当前出口IP: {sb.get_text('body')}")
-        except Exception:
-            pass
-
-        if login(sb):
-            renew_server(sb)   # 登录成功后自动续期
-        else:
-            print("\n❌ 登录失败，终止后续续期操作。")
-            send_tg_message("❌", "登录失败", "未知")
-
-if __name__ == "__main__":
-    main()
+            print(f"✅ ALTCHA 验证
