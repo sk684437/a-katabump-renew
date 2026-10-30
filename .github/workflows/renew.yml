@@ -10,10 +10,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: write  
-      contents: read
+      contents: write  # 🚨 需要写权限才能将时间更新推送到 README
     
     steps:
     - uses: actions/checkout@v6
+      with:
+        fetch-depth: 1 # 只需要拉取最新提交
+
     - name: ⚙ 设置 Python
       uses: actions/setup-python@v6
       with:
@@ -50,6 +53,28 @@ jobs:
         xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
           python3 app.py
         
+    - name: 📝 更新 README 时间 (防止 Action 休眠)
+      if: always() # 无论前面成功还是失败，都执行此步保活
+      run: |
+        # 设置 Git 机器人身份
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        
+        # 确保 README 存在，防止报错
+        touch README.md
+        
+        # 删除旧的运行时间记录（通过匹配特定前缀删除整行）
+        sed -i '/^> 🕒 最后运行时间:/d' README.md
+        
+        # 获取当前北京时间并追加到末尾
+        CURRENT_TIME=$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')
+        echo "> 🕒 最后运行时间: $CURRENT_TIME" >> README.md
+        
+        # 提交并推送到仓库
+        git add README.md
+        # 如果有更改则提交，跳过 CI 触发，防止无限循环
+        git diff --quiet && git diff --staged --quiet || (git commit -m "chore: 更新自动运行时间保活 [skip ci]" && git push)
+
     - name: 🧹 清理旧的工作流运行记录
       if: always()
       env:
